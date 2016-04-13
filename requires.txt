@@ -1,0 +1,7 @@
+PyGObject
+jira
+kerberos
+requests
+requests_kerberos
+#not on pip
+#pygtk2

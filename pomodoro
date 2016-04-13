@@ -1,0 +1,910 @@
+#!/usr/bin/env python
+# encoding:utf-8
+
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+import urlparse
+from abc import (
+    ABCMeta,
+    abstractmethod,
+    abstractproperty,
+)
+from ConfigParser import SafeConfigParser
+from functools import partial
+
+import gtk
+import kerberos
+import pygtk
+import requests
+import requests_kerberos
+from jira.client import JIRA
+
+pygtk.require('2.0')
+
+
+DEFAULT_CONFIG = {
+    'work_time': str(30 * 60),
+    'short_break': str(3 * 60),
+    'long_break': str(10 * 60),
+    'short_break_num': '4',
+    'ds_jira_url': 'http://my.ds.jira.url',
+    'ds_jira_auth': 'kerberos',
+    'ds_jira_user': 'dummyuser',
+    'ds_jira_password': 'notused',
+    'ds_jira_search': """
+        assignee = currentUser()
+        and status not in (
+            'Done',
+            'Cancelled (Rejected/Duplicate)',
+            'Resolved'
+        )
+        ORDER BY priority DESC""",
+    'us_jira_url': 'https://ovirt-jira.atlassian.net',
+    'us_jira_auth': 'basic',
+    'us_jira_user': 'dummyuser',
+    'us_jira_password': 'dummypass',
+    'us_jira_search': """
+        assignee in (currentUser())
+        and status not in (
+            'Done',
+            'Resolved',
+            'Closed'
+        )
+        ORDER BY priority DESC""",
+    'us_gerrit_url': 'gerrit.ovirt.org',
+    'ds_gerrit_url': 'myds.gerrit.fqdn',
+    'us_nagios_url': 'https://monitoring.ovirt.org/icinga/',
+    'us_nagios_user': 'dummyuser',
+    'us_nagios_pass': 'dummypass',
+    'ds_nagios_url': 'http://mydsnagios.wow',
+    'ds_nagios_user': 'dummyuser',
+    'ds_nagios_pass': 'dummypass',
+    'popup_sound': '/usr/share/sounds/gnome/default/alerts/drip.ogg',
+    'back_to_work_sound': '/usr/share/sounds/gnome/default/alerts/glass.ogg',
+}
+ISSUE_FEEDS = []
+COLOR = {
+    'red': '#FF6666',
+    'green': '#CCFF99',
+    'yellow': '#FFFF66',
+}
+NAGIOS_STATUS_REGS = {
+    'OK': r'serviceHeader\'>(?P<num>\d+) Ok<',
+    'WARN': r'serviceHeader\'>(?P<num>\d+) Warning<',
+    'UNK': r'serviceHeader\'>(?P<num>\d+) Unknown<',
+    'CRIT': r'serviceHeader\'>(?P<num>\d+) Critical<',
+    'PENDING': r'serviceHeader\'>(?P<num>\d+) Pending<',
+}
+
+
+def add_kerb_auth(session, url):
+    jiraurl = url
+    service = "HTTP@" + urlparse.urlparse(jiraurl).netloc
+    url = jiraurl + "/step-auth-gss"
+    _, krb_context = kerberos.authGSSClientInit(service)
+    kerberos.authGSSClientStep(krb_context, "")
+    auth_header = (
+        "Negotiate " + kerberos.authGSSClientResponse(krb_context)
+    )
+    res = session.get(jiraurl, headers={"Authorization": auth_header})
+    if res.status_code != 200:
+        raise Exception(
+            "Could not do kerberos auth. HTTP error %d on %s"
+            % (res.status_code, url)
+        )
+
+
+class Feed(object):
+    class __metaclass__(ABCMeta):
+        def __init__(cls, name, bases, attrs):
+            """
+            Metaclass in charge of the registering, inherits from ABCMeta
+            because ArtifactStore is an abstract class too.
+            """
+            ABCMeta.__init__(cls, name, bases, attrs)
+            # Don't register this base class
+            if name != 'Feed':
+                ISSUE_FEEDS.append(cls)
+
+    def populate(self, *args, **kwargs):
+        thread = threading.Thread(
+            target=self._populate,
+        )
+        thread.start()
+        return False
+
+
+class SimpleIssueWidget(object):
+    def __init__(self, config):
+        self._lock = threading.Lock()
+        self.config = config
+        self.sw = gtk.ScrolledWindow()
+        self.store = gtk.ListStore(str, str, str, str, str)
+        self.tw = gtk.TreeView(self.store)
+        self.tw.get_selection().set_mode(gtk.SELECTION_MULTIPLE)
+        self.sw.add(self.tw)
+        self.tw.connect('button_press_event', self.clicked)
+        self.create_colums()
+
+    @abstractproperty
+    def name(self):
+        """
+        Name of the feed
+        """
+        pass
+
+    @abstractmethod
+    def get_issues(self):
+        """
+        Return the list of issues for this feed, as 5-tuples of strings
+        (key, priority, summary, link, color)
+        """
+        pass
+
+    def connect_store(self, *args):
+        args = list(args) + [self.store]
+        self.tw.connect(*args)
+
+    def create_colums(self):
+        rendererText = gtk.CellRendererText()
+        column = gtk.TreeViewColumn("Key", rendererText, text=0,
+                                    background=4)
+        column.set_sort_column_id(0)
+        self.tw.append_column(column)
+
+        rendererText = gtk.CellRendererText()
+        column = gtk.TreeViewColumn("Priority", rendererText, text=1,
+                                    background=4)
+        column.set_sort_column_id(1)
+        self.tw.append_column(column)
+
+        rendererText = gtk.CellRendererText()
+        column = gtk.TreeViewColumn("Summary", rendererText, text=2,
+                                    background=4)
+        column.set_sort_column_id(2)
+        self.tw.append_column(column)
+
+    def _populate(self):
+        self._lock.acquire()
+        print 'Populating', self.name
+        self.store.clear()
+        self.store.append(['Loading...'] + [''] * 3 + ['#FFFFFF'])
+        issues = self.get_issues()
+        self.store.clear()
+        for issue in issues:
+            try:
+                self.store.append(issue)
+            except Exception:
+                print issue
+        self._lock.release()
+        return False
+
+    def get_selected(self):
+        ids = []
+        store, paths = self.tw.get_selection().get_selected_rows()
+        for path in paths:
+            treeiter = store.get_iter(path)
+            val = store.get_value(
+                treeiter,
+                0
+            )
+            ids.append(val)
+        return ids
+
+    def clicked(self, tw, event):
+        if event.type != gtk.gdk.BUTTON_PRESS or event.button != 3:
+            return
+        selected = self.get_selected()
+        menu = gtk.Menu()
+        close_issue = gtk.MenuItem("Close")
+        close_issue.connect('activate', self.close_issue, selected)
+        resolve_issue = gtk.MenuItem("Resolve")
+        resolve_issue.connect('activate', self.resolve_issue, selected)
+        close_issue.show()
+        resolve_issue.show()
+        menu.append(resolve_issue)
+        menu.append(close_issue)
+        menu.popup(None, None, None, event.button, event.time)
+        return True
+
+    def close_issue(self, widget, selected):
+        print "Closing ", selected
+        pass
+
+    def resolve_issue(self, widget, selected):
+        print "Resolving ", selected
+        pass
+
+
+class GerritIssueWidget(object):
+    def __init__(self, config):
+        self._lock = threading.Lock()
+        self.config = config
+        self.sw = gtk.VBox()
+
+        hbox = gtk.HBox()
+        label = gtk.Label()
+        label.set_text('My reviews')
+        label.set_angle(90)
+        hbox.pack_start(label, False, False, 0)
+        self.right_sw = gtk.ScrolledWindow()
+        hbox.pack_start(self.right_sw)
+        self.sw.pack_start(hbox)
+        self.right_store = gtk.ListStore(
+            str, str, str, str, str, str, str, str, str, str
+        )
+        self.right_tw = gtk.TreeView(self.right_store)
+        self.right_sw.add(self.right_tw)
+
+        hbox = gtk.HBox()
+        label = gtk.Label()
+        label.set_text('My patches')
+        label.set_angle(90)
+        hbox.pack_start(label, False, False, 0)
+        self.left_sw = gtk.ScrolledWindow()
+        hbox.pack_start(self.left_sw)
+        self.sw.pack_start(hbox)
+        self.left_store = gtk.ListStore(
+            str, str, str, str, str, str, str, str, str, str
+        )
+        self.left_tw = gtk.TreeView(self.left_store)
+        self.left_sw.add(self.left_tw)
+
+        self.create_colums()
+
+    @abstractproperty
+    def name(self):
+        """
+        Name of the feed
+        """
+        pass
+
+    @abstractproperty
+    def url(self):
+        pass
+
+    @abstractmethod
+    def get_issues(self):
+        """
+        Return the list of issues for this feed, as 5-tuples of strings
+        (key, priority, summary, link, color)
+        """
+        pass
+
+    @abstractmethod
+    def get_right_issues(self):
+        pass
+
+    @abstractmethod
+    def get_left_issues(self):
+        pass
+
+    def connect_store(self, *args):
+        left_args = list(args) + [self.left_store]
+        right_args = list(args) + [self.right_store]
+        self.left_tw.connect(*left_args)
+        self.right_tw.connect(*right_args)
+
+    def create_colums(self):
+        for index, col_name in enumerate((
+                "Summary",
+                "Project",
+                "Branch",
+                "Owner",
+                "Updated",
+                "W",
+                "CR",
+                "V",
+        )):
+            for tw in (self.left_tw, self.right_tw):
+                column = gtk.TreeViewColumn(
+                    col_name,
+                    gtk.CellRendererText(),
+                    text=index,
+                    background=9,
+                )
+                column.set_sort_column_id(index)
+                if col_name == 'Summary':
+                    column.set_expand(True)
+                else:
+                    column.set_expand(False)
+                tw.append_column(column)
+
+    def _populate(self):
+        self._lock.acquire()
+        print 'Populating', self.name
+        self.left_store.clear()
+        self.right_store.clear()
+        self.right_store.append(['Loading...'] + [''] * 8 + ['#FFFFFF'])
+        self.left_store.append(['Loading...'] + [''] * 8 + ['#FFFFFF'])
+        right_issues = sorted(self.get_right_issues(), key=lambda x: x[3])
+        left_issues = sorted(self.get_left_issues(), key=lambda x: x[3])
+        self.left_store.clear()
+        self.right_store.clear()
+        for issue in left_issues:
+            self.left_store.append(issue)
+        for issue in right_issues:
+            self.right_store.append(issue)
+        self._lock.release()
+        return False
+
+
+class NagiosIssueWidget(object):
+    def __init__(self, config):
+        self._lock = threading.Lock()
+        self.config = config
+        self.sw = gtk.HBox()
+        label = gtk.Label()
+        label.set_text('Current')
+        self.sw.pack_start(label, False, False, 0)
+        label_box = gtk.HBox()
+        self.sw.pack_start(label_box)
+
+        self.ok = gtk.Label()
+        self.warn = gtk.Label()
+        self.crit = gtk.Label()
+        self.unknown = gtk.Label()
+        self.pending = gtk.Label()
+
+        self.ok.color = '#00AA00'
+        self.warn.color = '#AA8800'
+        self.crit.color = '#FF0000'
+        self.unknown.color = '#AA2222'
+        self.pending.color = '#000000'
+
+        for label in (
+                self.ok, self.warn, self.crit, self.unknown, self.pending):
+            label_box.pack_start(label)
+
+    @abstractproperty
+    def name(self):
+        """
+        Name of the feed
+        """
+        pass
+
+    @abstractproperty
+    def url(self):
+        pass
+
+    @abstractproperty
+    def auth(self):
+        pass
+
+    def get_issues(self):
+        """
+        Return the list of issues for this feed, as 5-tuples of strings
+        (key, priority, summary, link, color)
+        """
+        info = {}
+        if 'trac_cgi' not in self.url:
+            nagios_url = self.url + '/cgi-bin/tac.cgi'
+        else:
+            nagios_url = self.url
+        params = {'verify': False}
+        if self.auth:
+            params['auth'] = self.auth
+        res = requests.get(nagios_url, **params)
+        for check_name, check_reg in NAGIOS_STATUS_REGS.items():
+            match = re.search(check_reg, res.text)
+            if match:
+                info[check_name] = match.groupdict().get('num')
+            else:
+                info[check_name] = 'Unknown'
+        print info
+        return info
+
+    def populate(self, *args):
+        self._lock.acquire()
+        print 'Populating', self.name
+        for label in (
+                self.ok, self.warn, self.crit, self.unknown, self.pending):
+            label.set_markup(
+                '<b><span foreground="%s">%s</span></b>'
+                % (label.color, 'Loading...')
+            )
+        info = self.get_issues()
+        self.ok.set_markup(
+            '<b><span foreground="%s">%s OK</span></b>'
+            % (self.ok.color, info['OK'])
+        )
+        self.warn.set_markup(
+            '<b><span foreground="%s">%s WARN</span></b>'
+            % (self.warn.color, info['WARN'])
+        )
+        self.crit.set_markup(
+            '<b><span foreground="%s">%s CRIT</span></b>'
+            % (self.crit.color, info['CRIT'])
+        )
+        self.pending.set_markup(
+            '<b><span foreground="%s">%s PEN</span></b>'
+            % (self.pending.color, info['PENDING'])
+        )
+        self.unknown.set_markup(
+            '<b><span foreground="%s">%s UNK</span></b>'
+            % (self.unknown.color, info['UNK'])
+        )
+        self._lock.release()
+        return False
+
+    def connect_store(self, *args):
+        pass
+
+
+class UsNagiosFeed(NagiosIssueWidget):
+    name = 'Upstream Icinga'
+
+    @property
+    def url(self):
+        return self.config.getopt('us_nagios_url')
+
+    @property
+    def auth(self):
+        return (
+            self.config.getopt('us_nagios_user'),
+            self.config.getopt('us_nagios_pass'),
+        )
+
+
+class DsNagiosFeed(NagiosIssueWidget):
+    name = 'Downstream Nagios'
+
+    @property
+    def url(self):
+        return self.config.getopt('ds_nagios_url')
+
+    @property
+    def auth(self):
+        return (
+            self.config.getopt('ds_nagios_user'),
+            self.config.getopt('ds_nagios_pass'),
+        )
+
+
+class JiraFeed(Feed, SimpleIssueWidget):
+    name = "Jira"
+    conf_keys = [
+        "ds_jira",
+        "us_jira",
+    ]
+
+    def __init__(self, config):
+        SimpleIssueWidget.__init__(self, config)
+
+    def get_issues(self):
+        issues = []
+        for key in self.conf_keys:
+            issues.extend(self.get_single_issues(key))
+        return issues
+
+    def get_single_issues(self, conf_key):
+        config_get = lambda key: self.config.getopt(conf_key + '_' + key)
+        auth_type = config_get('auth')
+        base_url = config_get('url')
+
+        if auth_type == 'kerberos':
+            jira_srv = JIRA(
+                options={
+                    "server": base_url,
+                    "verify": False,
+                },
+            )
+            response = jira_srv._session.get(
+                base_url + '/step-auth-gss',
+                auth=requests_kerberos.HTTPKerberosAuth(
+                    mutual_authentication=requests_kerberos.DISABLED
+                )
+            )
+            if not response.ok:
+                raise Exception(
+                    "Failed to authenticate with kerberos:%s",
+                    response,
+                )
+        else:
+            jira_srv = JIRA(
+                options={
+                    "server": base_url,
+                    "verify": False,
+                },
+                basic_auth=(
+                    config_get('user'),
+                    config_get('password'),
+                )
+            )
+        print self.name, conf_key, jira_srv.DEFAULT_OPTIONS
+        jira_issues = jira_srv.search_issues(
+            config_get('search'),
+        )
+        issues = []
+        for issue in jira_issues:
+            if (
+                issue.fields.priority
+                and issue.fields.priority.name in (
+                    'Blocker', 'Highest', 'High'
+                )
+            ):
+                color = COLOR['red']
+            elif (
+                issue.fields.priority
+                and issue.fields.priority.name in (
+                    'Critical', 'Medium', 'Major'
+                )
+            ):
+                color = COLOR['yellow']
+            else:
+                color = COLOR['green']
+            issues.append((
+                issue.key,
+                (
+                    issue.fields.priority.name
+                    if issue.fields.priority
+                    else 'None'
+                ),
+                issue.fields.summary,
+                config_get('url') + '/browse/%s'
+                % issue.key,
+                color,
+            ))
+        return issues
+
+    def close_issue(self, widget, selected):
+        print "Closing ", selected
+
+    def resolve_issue(self, widget, selected):
+        print "Resolving ", selected
+
+
+class GerritFeed(GerritIssueWidget):
+    def __init__(self, config):
+        GerritIssueWidget.__init__(self, config)
+
+    def get_left_issues(self):
+        issues = []
+        for issue in gerrit_query(self.url, 'owner:self status:open'):
+            issues.append(parse_gerrit_issue(issue))
+        return issues
+
+    def get_right_issues(self):
+        issues = []
+        for issue in gerrit_query(
+                self.url,
+                'status:open reviewer:self NOT owner:self'
+        ):
+            issues.append(parse_gerrit_issue(issue))
+        return issues
+
+
+class DsGerritFeed(Feed, GerritFeed):
+    name = "Downstream Gerrit"
+
+    @property
+    def url(self):
+        return self.config.getopt('ds_gerrit_url')
+
+
+def gerrit_query(url, query):
+    res = subprocess.check_output(
+        [
+            'ssh',
+            url,
+            'gerrit',
+            'query',
+            '--format=json',
+            '--current-patch-set',
+            query,
+        ]
+    )
+    res = [json.loads(i) for i in res.splitlines()[:-1]]
+    return res
+
+
+def gerrit_get_review(issue, review_type):
+    value = 0
+    for review in issue['currentPatchSet'].get('approvals', []):
+        if review['type'] == review_type:
+            if value ** 2 <= int(review['value']) ** 2:
+                if int(review['value']) < 0 or value == 0:
+                    value = int(review['value'])
+    return value
+
+
+def gerrit_get_color(issue):
+    ver = gerrit_get_review(issue, 'Verified')
+    rev = gerrit_get_review(issue, 'Code-Review')
+    if ver < 0:
+        return COLOR['red']
+    if ver > 0:
+        return COLOR['green']
+    if rev == -2:
+        return COLOR['red']
+    if rev < 0:
+        return COLOR['yellow']
+    if rev > 0:
+        return COLOR['green']
+    return COLOR['green']
+
+
+def parse_gerrit_issue(issue):
+    return (
+        issue['subject'],
+        issue['project'],
+        issue['branch'],
+        issue['owner']['name'],
+        issue['lastUpdated'],
+        gerrit_get_review(issue, 'Workflow'),
+        gerrit_get_review(issue, 'Code-Review'),
+        gerrit_get_review(issue, 'Verified'),
+        issue['url'],
+        gerrit_get_color(issue),
+    )
+
+
+class UsGerritFeed(Feed, GerritFeed):
+    name = "Upstream Gerrit"
+
+    @property
+    def url(self):
+        return self.config.getopt('us_gerrit_url')
+
+
+def play(config, ptype='popup'):
+    subprocess.Popen([
+        'paplay',
+        config.getopt(ptype + '_sound')
+    ])
+    return True
+
+
+def updateGUI():
+    '''Force update of GTK mainloop during a long-running process'''
+    while gtk.events_pending():
+        gtk.main_iteration(False)
+
+
+def to_nice_time(secs):
+    hours = secs / 3600
+    mins = secs % 3600 / 60
+    secs = secs % 60
+
+    if hours < 10:
+        hours = '0%s' % hours
+    if mins < 10:
+        mins = '0%s' % mins
+    if secs < 10:
+        secs = '0%s' % secs
+
+    return "%s:%s:%s" % (hours, mins, secs)
+
+
+def get_pane(title, content, update_callback, alarm=False):
+    pane_box = gtk.VBox()
+    title_box = gtk.HBox()
+    update_icon = gtk.Button(stock=gtk.STOCK_REFRESH)
+    label = gtk.Label()
+    label.set_text(title)
+    title_box.pack_start(update_icon, False, False, 0)
+    title_box.pack_start(label, True, True, 0)
+    pane_box.pack_start(title_box, False, False, 0)
+    pane_box.pack_start(content, True, True, 0)
+    update_icon.connect('clicked', update_callback)
+    return pane_box
+
+
+class IssueBrowser(gtk.Window):
+    def __init__(self, config):
+        global ISSUE_FEEDS
+        super(IssueBrowser, self).__init__()
+
+        self.config = config
+        self.connect("delete-event", lambda x, y: self.toggle())
+        self.status = 'WORKING'
+        self.cur_loop = 0
+        vbox = gtk.VBox(False, 0)
+
+        ISSUE_FEEDS = [feed(config=config) for feed in ISSUE_FEEDS]
+        num_feeds = len(ISSUE_FEEDS)
+        left_feeds = ISSUE_FEEDS[:(num_feeds / 2)]
+        right_feeds = ISSUE_FEEDS[(num_feeds / 2):]
+        alarm_feeds = (
+            DsNagiosFeed(config=config),
+            UsNagiosFeed(config=config)
+        )
+        self.alarm_feeds = alarm_feeds
+
+        hbox = gtk.HBox(True, 0)
+        left_box = gtk.VBox(True, 0)
+        right_box = gtk.VBox(True, 0)
+        alarm_box = gtk.HBox(True, 0)
+
+        lower_box = gtk.HBox()
+        self.button = gtk.Button("Close")
+        self.button.connect("clicked", self.quit)
+
+        self.hide_button = gtk.Button("Hide")
+        self.hide_button.connect("clicked", lambda x: self.toggle())
+
+        self.work_button = gtk.Button("Start work period!")
+        self.work_button.connect("clicked", lambda x: self.next_iter())
+
+        self.timer = gtk.Label()
+        self.timer.set_time = time.time()
+        self.timer.time_left = 0.0
+
+        self.status_icon = gtk.status_icon_new_from_file(
+            os.path.expanduser('~/dotfiles/tomato.png')
+        )
+        self.set_icon_from_file(
+            os.path.expanduser('~/dotfiles/tomato.png')
+        )
+        self.status_icon.connect("activate", lambda x: self.toggle())
+
+        self.clock = gtk.Label()
+        self.clock.set_text(time.strftime('%H:%M:%S %d-%m-%Y'))
+        lower_box.pack_start(self.clock, False, False, 0)
+        lower_box.pack_start(self.timer, True, True, 0)
+        lower_box.pack_start(self.hide_button, False, False, 0)
+        lower_box.pack_start(self.work_button, False, False, 0)
+        lower_box.pack_start(self.button, False, False, 0)
+
+        for feed in alarm_feeds:
+            alarm_box.pack_start(
+                get_pane(
+                    feed.name,
+                    feed.sw,
+                    feed.populate,
+                    alarm=True,
+                ),
+                True, True, 0)
+        for feed in left_feeds:
+            left_box.pack_start(
+                get_pane(
+                    feed.name,
+                    feed.sw,
+                    feed.populate),
+                True, True, 0)
+        for feed in right_feeds:
+            right_box.pack_start(
+                get_pane(
+                    feed.name,
+                    feed.sw,
+                    feed.populate),
+                True, True, 0)
+
+        vbox.pack_start(alarm_box, False, False, 0)
+        hbox.pack_start(left_box, True, True, 0)
+        hbox.pack_start(right_box, True, True, 0)
+        vbox.pack_start(hbox, True, True, 0)
+        vbox.pack_start(lower_box, False, False, 0)
+        self.add(vbox)
+
+        for feed in ISSUE_FEEDS:
+            feed.connect_store('row-activated', self.clicked)
+
+        self.set_decorated(gtk.FALSE)
+        self.fullscreen()
+        self.show_all()
+
+    def populate(self):
+        print 'populating'
+        for feed in ISSUE_FEEDS:
+            feed.populate()
+        for feed in self.alarm_feeds:
+            feed.populate()
+        return False
+
+    def clicked(self, t_view, t_path, column, store):
+        subprocess.Popen([
+            'xdg-open',
+            store[t_path[0]][-2],
+        ])
+        return True
+
+    def main(self):
+        gtk.gdk.threads_init()
+        gtk.timeout_add(200, self.update_timer)
+        self.populate()
+        gtk.main()
+        while True:
+            self.next_iter()
+
+    def update_timer(self):
+        now = time.time()
+        self.clock.set_label(time.strftime('%H:%M:%S %d-%m-%Y'))
+        passed_time = now - self.timer.set_time
+        time_left = self.timer.time_left - passed_time
+        color = '#00FF00'
+        extra = 1
+        if time_left <= 0:
+            time_left = 0
+            color = '#FF0000'
+            extra = 0
+            if self.status == 'BREAK':
+                play(ptype='back_to_work', config=self.config)
+                self.status = 'WORKING'
+        self.timer.time_left = float(time_left)
+        self.timer.set_time = now
+        self.timer.set_markup(
+            '<span foreground="%s">%s</span>'
+            % (color,
+               to_nice_time(int(self.timer.time_left) + extra)))
+        return True
+
+    def mysleep(self, secs):
+        start = time.time()
+        end = start + secs
+        self.timer.set_time = start
+        self.timer.time_left = secs
+        for i in range(int(secs * 10)):
+            time.sleep(0.1)
+            self.update_timer()
+            updateGUI()
+            if not i % 10:
+                print "%f seconds left" % (end - time.time())
+
+    def next_iter(self, *args):
+        try:
+            self.hide()
+            gtk.gdk.flush()
+            print 'Work time!'
+            self.status = 'WORKING'
+            self.mysleep(self.config.getintopt('work_time'))
+            self.populate()
+            self.show_all()
+            gtk.gdk.flush()
+            self.take_break()
+        except KeyboardInterrupt:
+            self.quit()
+
+    def toggle(self):
+        if self.get_visible():
+            self.hide()
+            print "Hiding"
+        else:
+            self.show_all()
+            print "Showing"
+        gtk.gdk.flush()
+        return gtk.TRUE
+
+    def take_break(self):
+        print "Take a break!"
+        play(config=self.config)
+        self.status = 'BREAK'
+        self.cur_loop += 1
+        short_break = self.config.getintopt('short_break')
+        if self.cur_loop % self.config.getintopt('short_break_num'):
+            self.timer.time_left = short_break
+            self.timer.set_time = time.time()
+            self.mysleep(short_break)
+        else:
+            print "    A long one"
+            long_break = self.config.getintopt('long_break')
+            self.timer.time_left = long_break
+            self.timer.set_time = time.time()
+            self.mysleep(long_break)
+            self.cur_loop = 0
+
+    def quit(self, *args, **kwargs):
+        gtk.main_quit()
+        exit()
+
+
+if __name__ == '__main__':
+    config = SafeConfigParser(
+        defaults=DEFAULT_CONFIG,
+    )
+    config.read(
+        os.path.expanduser(
+            '~/.pomodororc',
+        )
+    )
+    if not config.has_section('pomodoro'):
+        config.add_section('pomodoro')
+
+    config.getopt = partial(config.get, 'pomodoro')
+    config.getintopt = partial(config.getint, 'pomodoro')
+    pomodoro = IssueBrowser(config=config)
+    pomodoro.main()
